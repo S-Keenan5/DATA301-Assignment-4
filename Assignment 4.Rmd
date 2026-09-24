@@ -1,0 +1,312 @@
+---
+title: "DATA301 Assignment 4"
+author: "Sean Keenan"
+date: "2026-09-16"
+output: pdf_document
+---
+
+**Excercise 1**
+
+Summary of Wicklin (2017) and Hyndman & Fan (1996)
+
+Hyndman and Fan (1996) identified nine distinct definitions of sample
+quantiles in common use across statistical software, and Wicklin (2017)
+visualizes and compares them. The nine definitions split into two
+families:
+
+Types 1–3 (discontinuous, rounding based) these select an actual
+  observed order statistic $x_{(j)}$ as the quantile estimate directly, with
+  no interpolation between adjacent points. The quantile
+  function has jumps.
+
+Types 4–9 (continuous, interpolation based) these estimate the
+  quantile as a weighted average of two adjacent order statistics,
+  $x_{(j)}$ and $x_{(j+1)}$:
+
+$$
+\hat{q}_p = (1-\lambda)\, x_{(j)} + \lambda\, x_{(j+1)}
+$$
+The index $j$ and interpolation weight $\lambda \in [0,1]$ are
+computed from the sample size $n$, the target probability $p$, and a
+specific constant $m$:
+
+$$
+j = \lfloor np + m \rfloor, \qquad \lambda = np + m - j
+$$
+
+Which type would I use, and why?
+
+I would use type 7 
+
+It is the type used by R's quantile() function by default, so results
+are reproducible and comparable with others default R
+code. It is also the most common default across major software packages, 
+which makes comparison straightforward.
+
+It performs well across a range of sample sizes without
+requiring a specific parametric assumption to justify the
+plotting position.
+  
+R's default type is type 7
+```{r}
+args(stats:::quantile.default)
+```
+
+/
+
+
+#Part 1 First order bootstrap bias corrected estimator
+```{r}
+
+set.seed(2026)
+
+
+#Maximum likelihood estimator
+lambda_ml <- function(x) 1 / mean(x)
+
+#estimator, using R default type
+lambda_iqr <- function(x) {
+  q <- quantile(x, probs = c(0.25, 0.75), type = 7)
+  log(3) / (q[[2]] - q[[1]])
+}
+
+#First-order bootstrap bias-corrected estimator based on lambda_iqr
+lambda_bc <- function(x, B = 200) {
+  n <- length(x)
+  T_hat <- lambda_iqr(x)
+  Tboot <- numeric(B)
+  for (b in 1:B) {
+    xb <- sample(x, n, replace = TRUE)
+    Tboot[b] <- lambda_iqr(xb)
+  }
+  bias_hat <- mean(Tboot) - T_hat
+  T_hat - bias_hat
+}
+
+x_test <- rexp(30, rate = 1)
+lambda_ml(x_test)
+lambda_iqr(x_test)
+lambda_bc(x_test, B = 200)
+```
+The bootstrap estimate of the bias of $\hat\lambda_{IQR}$ is
+$$\widehat{\text{Bias}} = \frac{1}{B}\sum_{b=1}^{B} \hat\lambda_{IQR}^{*(b)} - \hat\lambda_{IQR}$$
+so the first-order bias-corrected estimator is
+$$\tilde\lambda = \hat\lambda_{IQR} - \widehat{\text{Bias}} = 2\hat\lambda_{IQR} - \frac{1}{B}\sum_{b=1}^{B}\hat\lambda_{IQR}^{*(b)}$$
+
+
+```{r}
+
+library(matrixStats)
+
+#estimators used in the experiment
+lambda_ml <- function(x) 1 / mean(x)
+
+lambda_iqr <- function(x) {
+  q <- quantile(x, probs = c(0.25, 0.75), type = 7)
+  log(3) / (q[[2]] - q[[1]])
+}
+
+lambda_bc <- function(x, B = 200) {
+  n <- length(x)
+  T_hat <- lambda_iqr(x)
+  idx <- matrix(sample.int(n, n * B, replace = TRUE), nrow = n, ncol = B)
+  boot_mat <- matrix(x[idx], nrow = n, ncol = B)
+  q <- colQuantiles(boot_mat, probs = c(0.25, 0.75), type = 7)
+  Tboot <- log(3) / (q[, 2] - q[, 1])
+  # a resampled q3 == q1 sends lambda_iqr to Inf - drop those before averaging
+  Tboot <- Tboot[is.finite(Tboot)]
+  T_hat - (mean(Tboot) - T_hat)
+}
+
+set.seed(2026)
+
+# because X ~ Exp(lambda) implies lambda*X ~ Exp(1)
+pilot_M <- 500
+target_rel_precision <- 0.05   
+max_M <- 10000  
+
+N <- c(5, 30, 100)
+Lambda <- c(0.1, 1, 10)
+B <- 200
+
+M_by_n <- setNames(numeric(length(N)), N)
+
+for (n in N) {
+  sq_err <- matrix(NA, pilot_M, 3)
+  colnames(sq_err) <- c("ML", "IQR", "BC")
+  for (m in 1:pilot_M) {
+    x <- rexp(n, rate = 1)
+    sq_err[m, "ML"]  <- (lambda_ml(x)  - 1)^2
+    sq_err[m, "IQR"] <- (lambda_iqr(x) - 1)^2
+    sq_err[m, "BC"]  <- (lambda_bc(x, B) - 1)^2
+  }
+  ok <- apply(sq_err, 1, function(r) all(is.finite(r)))
+  sq_err <- sq_err[ok, ]
+
+  pilot_MSE <- colMeans(sq_err)
+  pilot_SD  <- apply(sq_err, 2, sd)
+  required_M <- (pilot_SD / (target_rel_precision * pilot_MSE))^2
+
+  M_by_n[as.character(n)] <- min(ceiling(max(required_M) / 100) * 100, max_M)
+}
+
+cat("chosen M by n"); print(M_by_n)
+
+#main experiment over lambda x n, using the M chosen for each n
+results <- expand.grid(lambda = Lambda, n = N)
+results$MSE_ML  <- NA
+results$MSE_IQR <- NA
+results$MSE_BC  <- NA
+
+for (i in seq_len(nrow(results))) {
+  lam <- results$lambda[i]
+  n <- results$n[i]
+  M <- M_by_n[as.character(n)]
+
+  sq_err <- matrix(NA, M, 3)
+  colnames(sq_err) <- c("ML", "IQR", "BC")
+  for (m in 1:M) {
+    x <- rexp(n, rate = lam)
+    sq_err[m, "ML"]  <- (lambda_ml(x)  - lam)^2
+    sq_err[m, "IQR"] <- (lambda_iqr(x) - lam)^2
+    sq_err[m, "BC"]  <- (lambda_bc(x, B) - lam)^2
+  }
+
+
+  results$MSE_ML[i]  <- mean(sq_err[, "ML"], na.rm = TRUE)
+  results$MSE_IQR[i] <- mean(sq_err[is.finite(sq_err[, "IQR"]), "IQR"])
+  results$MSE_BC[i]  <- mean(sq_err[is.finite(sq_err[, "BC"]), "BC"])
+}
+
+print(results)
+
+#plot the results
+library(ggplot2)
+library(tidyr)
+
+results_long <- pivot_longer(results, starts_with("MSE_"), names_to = "estimator", values_to = "MSE")
+results_long$estimator <- sub("MSE_", "", results_long$estimator)
+
+ggplot(results_long, aes(factor(n), MSE, color = estimator, group = estimator)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~lambda, scales = "free_y") +
+  scale_y_log10()
+```
+
+/
+
+
+#exercise 2
+```{r}
+library(fpp2)
+data(ausbeer)
+
+
+frequency(ausbeer)
+start(ausbeer); end(ausbeer)
+cycle(ausbeer)[1:8]
+time(ausbeer)[1:8]
+
+
+plot(ausbeer, main = "quarterly Australian beer production",
+     xlab = "Year", ylab = "megalitres")
+
+#seasonal plot 
+ggseasonplot(ausbeer, year.labels = TRUE) +
+  ggtitle("seasonal plot ausbeer")
+
+ggseasonplot(ausbeer, polar = TRUE) +
+  ggtitle("polar seasonal plot ausbeer")
+
+#same idea for the airpassengers thing
+df <- data.frame(
+  value = as.numeric(ausbeer),
+  qtr   = as.numeric(cycle(ausbeer)),
+  yr    = floor(time(ausbeer))
+)
+library(ggplot2)
+ggplot(df, aes(x = qtr, y = value, group = yr, color = factor(yr))) +
+  geom_line() + geom_point() +
+  labs(x = "quarter", y = "megalitres", color = "year")
+
+#subseries plot
+monthplot(ausbeer, main = "subseries plot via monthplot()")
+
+#supporting numeric summaries
+q <- cycle(ausbeer)
+tapply(ausbeer, q, function(x) c(mean = mean(x), sd = sd(x)))
+
+which.min(ausbeer); time(ausbeer)[which.min(ausbeer)]; min(ausbeer)
+which.max(ausbeer); time(ausbeer)[which.max(ausbeer)]; max(ausbeer)
+
+early <- window(ausbeer, end = c(1975, 4))
+late  <- window(ausbeer, start = c(1990, 1))
+
+variability_table <- data.frame(
+  poeriod = c("early (1956-1975)", "Late (1990-2010)"),
+  mean = c(mean(early), mean(late)),
+  SD = c(sd(early), sd(late))
+)
+knitr::kable(variability_table, digits = 1, caption = "mean and sd early vs. late ausbeer")
+
+freq <- frequency(ausbeer)
+cat("frequency = ", freq)
+
+#transform -> detrend -> remove periodicity
+plot(ausbeer, main = "Original series")
+plot(log(ausbeer), main = "log transformed series")
+```
+
+/
+
+*1.*
+From the time-series plot we cans see 4 oscillations in each labelled year on the x axis giving us a frequency of 4. We can also use frequency(ausbeer) to give us the frequency value which is also 4.
+/
+
+*2.*
+Overall trend is not monotonic. From the frequency plot we can see the data climbs steadily from 1950's until the mid 1970's. There is then a gentle decline from the mid 1970's until the the 2010's.
+
+/
+
+*3.*
+From the seasonality plot we can see clear strong seasonality. Every years line follows the same shape and clear dips through Q2 and Q3 and then rises again into Q4. From the mean per quarter table we can not that Q2 has the lowest mean of 372.61818 and Q4 has the highest mean of 485.44444. 
+
+/
+
+*4.*
+Using the first frequency plot we can clearly see that the seasonal spikes become much larger after the mid 1970's showing a clear increase in variability through time. We can also use the computed standard deviation for 1956-1975 is 47.8 whereas the 1990-2010 standard deviation is 85.9. This is a clear increase in variability.
+
+/
+
+*5.*
+There are two outstanding spikes around 1990-1991 that are much bigger than the surrounding spikes. We can also note that in 2010 the last spike shows a drop in bear production down to levels as low as 1970.
+
+/
+
+*6.*
+As stated previously using the seasonal plot shows a clear dip between into Q2 and Q3. This can be identified as the autumn winter season where beer production in megalitres drops likely due to smaller demand as weather in Australia is not as warm and sunny. By plotting each year as one line it allows us to see much clear the quarterly change in values that the normal frequency plot does not show.
+
+/
+
+*7.*
+From the quarterly sub-series plot we can see Q4 clearly sits the highest. This matches the quarterly mean values with Q4 having the highest mean production of beer of 485 million litres of beer. The lowest production of beer is seen in Q2 with e mean value of 327 million litres of beer. This is supported again by the sub-series plot where the Q2 mean is the lowest line of the 4 quarters. The seasonal pattern is does change from quarter to quarter. We can see a clear rise in at the beginning of each quarter with a regular decline. However, there is a sharp increase in the middle of Q4 and that is irregular from the other 3 quarters. This is likely the Christmas New Years period where production of beer increases to match the the holiday demand.
+
+
+/
+
+*8.*
+The original time series plot show a non monotonic relationship with a clear upward trend up until the mid 1970's followed by a very gentle downward trend towards the 2010's. This justifies de-trending the data as there is an obvious upward and downward trend in the time-series plot.
+
+Using the log transformed time series plot we would expect the size of the spikes to shrink particularly the large spikes as the log transformation will shrink large values. The plot shows a negligible change in spike size showing the log transformation is not fit for the data. This helps us conclude that the variance is roughly stable as the variance stablilising transformation such as the log transformation did fix any variation in the plotted spikes.
+
+
+
+
+
+
+
+
+
+  
+  
